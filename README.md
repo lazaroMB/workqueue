@@ -5,6 +5,8 @@ of work items among worker threads for processing. The library provides an API f
 adding work items to a queue, starting and stopping worker threads, and querying the state 
 of the queue.
 
+check doc in https://pkg.go.dev/github.com/lazaroMB/workqueue
+
 ## Usage example
 ```
 type Process struct {
