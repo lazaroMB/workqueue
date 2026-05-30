@@ -6,7 +6,7 @@ package workqueue
 
 import (
 	"errors"
-	"math"
+	"sync"
 )
 
 // WorkItemI interface has a single method named "Exec".
@@ -29,17 +29,26 @@ type WorkQueueI[T WorkItemI] interface {
 }
 
 type WorkQueue[T WorkItemI] struct {
+	mu              sync.RWMutex
 	queue           []T
 	maxThreads      int
 	processingCount int
 	addQueueChan    chan T
 	stopWorkerChan  chan bool
 	endJobChan      chan bool
+	stopped         bool
 }
 
 // Takes a single argument "workItem T", which represents a work item of type T 
 // that implements the WorkItemI interface.
 func (w *WorkQueue[T]) AddWork(item T) {
+	w.mu.Lock()
+	if w.stopped {
+		w.mu.Unlock()
+		return
+	}
+	w.mu.Unlock()
+
 	w.addQueueChan <- item
 }
 
@@ -50,53 +59,64 @@ func (w *WorkQueue[T]) StartWorker() {
 		select {
 		case res := <-w.addQueueChan:
 			w.addToQueue(res)
-			if ok := w.tryToExecNextTask(); ok {
-				w.processingCount++
-			}
+			w.tryToExecNextTask()
 		case <-w.endJobChan:
-			w.processingCount--
-			if ok := w.tryToExecNextTask(); ok {
-				w.processingCount++
-			}
+			w.tryToExecNextTask()
 		case <-w.stopWorkerChan:
 			runPool = false
 		}
 	}
-	defer close(w.endJobChan)
-	defer close(w.stopWorkerChan)
-	defer close(w.addQueueChan)
 }
 
 // Stops the worker thread.
 func (w *WorkQueue[T]) StopWorker() {
+	w.mu.Lock()
+	if w.stopped {
+		w.mu.Unlock()
+		return
+	}
+	w.stopped = true
+	w.mu.Unlock()
+
 	w.stopWorkerChan <- true
 }
 
 // Returns the size of the work queue as an integer.
 func (w *WorkQueue[T]) GetQueueSize() int {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
 	return len(w.queue)
 }
 
 // Returns the number of work items currently being processed by the worker thread as an integer.
 func (w *WorkQueue[T]) GetProcessingCount() int {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
 	return w.processingCount
 }
 
 // Returns the occupation rate of the worker thread as a float64 value.
 func (w *WorkQueue[T]) GetThreadsOccupation() float64 {
-	if w.maxThreads == 0 {
-		return 1
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.maxThreads <= 0 {
+		return 1.0
 	}
-	return math.Ceil(float64(w.processingCount)/float64(w.maxThreads)) / 100
+	return float64(w.processingCount) / float64(w.maxThreads)
 }
 
 // Returns a boolean indicating whether the worker thread has capacity to process more work items.
 func (w *WorkQueue[T]) HasThreadsCapacity() bool {
-	return w.GetThreadsOccupation() < 1
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.maxThreads <= 0 {
+		return false
+	}
+	return w.processingCount < w.maxThreads
 }
 
-func (w *WorkQueue[T]) getNextTask() (T, error) {
-	if w.GetQueueSize() == 0 {
+func (w *WorkQueue[T]) getNextTaskUnlocked() (T, error) {
+	if len(w.queue) == 0 {
 		return *new(T), errors.New(EMPTY_QUEUE_ERROR_MSG)
 	}
 	job := w.queue[0]
@@ -104,25 +124,50 @@ func (w *WorkQueue[T]) getNextTask() (T, error) {
 	return job, nil
 }
 
+func (w *WorkQueue[T]) getNextTask() (T, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.getNextTaskUnlocked()
+}
+
 func (w *WorkQueue[T]) tryToExecNextTask() bool {
-	if !w.HasThreadsCapacity() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.maxThreads <= 0 || w.processingCount >= w.maxThreads {
 		return false
 	}
-	nextTask, err := w.getNextTask()
+	nextTask, err := w.getNextTaskUnlocked()
 	if err != nil {
 		return false
 	}
+	w.processingCount++
 	go w.startJob(nextTask)
 
 	return true
 }
 
 func (w *WorkQueue[T]) startJob(job T) {
+	defer func() {
+		w.mu.Lock()
+		w.processingCount--
+		stopped := w.stopped
+		w.mu.Unlock()
+
+		if !stopped {
+			select {
+			case w.endJobChan <- true:
+			default:
+				// Non-blocking write to avoid hanging if the worker stopped
+			}
+		}
+	}()
 	job.Exec()
-	w.endJobChan <- true
 }
 
 func (w *WorkQueue[T]) addToQueue(job T) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.queue = append(w.queue, job)
 }
 
@@ -134,7 +179,7 @@ func New[T WorkItemI](maxThreads int) WorkQueueI[T] {
 		queue:           make([]T, 0),
 		processingCount: 0,
 		addQueueChan:    make(chan T),
-		endJobChan:      make(chan bool),
-		stopWorkerChan:  make(chan bool),
+		endJobChan:      make(chan bool, maxThreads+1), // Buffered to handle multiple signals without blocking
+		stopWorkerChan:  make(chan bool, 1),
 	}
 }

@@ -8,18 +8,27 @@ of the queue.
 check doc in https://pkg.go.dev/github.com/lazaroMB/workqueue
 
 ## Usage example
-```
+```go
+package main
+
+import (
+	"time"
+	"github.com/lazaroMB/workqueue"
+)
+
 type Process struct {
-    delay time.Duration
+	delay time.Duration
 }
 
 func (p *Process) Exec() {
-    time.Sleep(delay time.Second)
+	time.Sleep(p.delay)
 }
 
-queue := New[*Process](5) // 5 workers
+func main() {
+	queue := workqueue.New[*Process](5) // 5 workers
 
-go queue.StartWorker()
+	go queue.StartWorker()
 
-queue.AddWork(&Process{delay: 10})
+	queue.AddWork(&Process{delay: 10 * time.Second})
+}
 ```

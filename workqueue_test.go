@@ -2,6 +2,7 @@ package workqueue
 
 import (
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -9,13 +10,13 @@ import (
 )
 
 type MockWorkItem struct {
-	sleep     time.Duration
-	excecuted bool
+	sleep    time.Duration
+	executed atomic.Bool
 }
 
 func (m *MockWorkItem) Exec() {
 	time.Sleep(m.sleep)
-	m.excecuted = true
+	m.executed.Store(true)
 }
 
 func TestAddToQueue(t *testing.T) {
@@ -27,11 +28,11 @@ func TestAddToQueue(t *testing.T) {
 		endJobChan:      make(chan bool),
 		stopWorkerChan:  make(chan bool),
 	}
-	work.addToQueue(&MockWorkItem{sleep: 2 * time.Second})
-	assert.Equal(t, work.GetQueueSize(), 1, "This should be 5")
+	work.addToQueue(&MockWorkItem{sleep: 0})
+	assert.Equal(t, work.GetQueueSize(), 1, "This should be 1")
 }
 
-func TestGetNestTask(t *testing.T) {
+func TestGetNextTask(t *testing.T) {
 	work := &WorkQueue[*MockWorkItem]{
 		maxThreads:      1,
 		queue:           make([]*MockWorkItem, 0),
@@ -43,7 +44,7 @@ func TestGetNestTask(t *testing.T) {
 	_, err := work.getNextTask()
 	assert.Error(t, err)
 	assert.Equal(t, err, errors.New(EMPTY_QUEUE_ERROR_MSG))
-	work.addToQueue(&MockWorkItem{sleep: 2 * time.Second})
+	work.addToQueue(&MockWorkItem{sleep: 0})
 	assert.Equal(t, work.GetQueueSize(), 1, "This should be 1")
 	_, err = work.getNextTask()
 	assert.Equal(t, work.GetQueueSize(), 0, "This should be 0")
@@ -59,19 +60,21 @@ func TestTryExecNextTask(t *testing.T) {
 		endJobChan:      make(chan bool),
 		stopWorkerChan:  make(chan bool),
 	}
-	excecuted := work.tryToExecNextTask()
-	assert.Equal(t, excecuted, false, "This should by false")
-	work.addToQueue(&MockWorkItem{sleep: 2 * time.Second})
-	excecuted = work.tryToExecNextTask()
-	assert.Equal(t, excecuted, true, "This should be true")
+	executed := work.tryToExecNextTask()
+	assert.Equal(t, executed, false, "This should be false")
+	work.addToQueue(&MockWorkItem{sleep: 0})
+	executed = work.tryToExecNextTask()
+	assert.Equal(t, executed, true, "This should be true")
 }
 
 func TestAddWorkToWorkQueue(t *testing.T) {
 	work := New[*MockWorkItem](0)
 	go work.StartWorker()
-	work.AddWork(&MockWorkItem{sleep: 1 * time.Second})
-	time.Sleep(1 * time.Second)
-	assert.Equal(t, work.GetQueueSize(), 1, "This should be 5")
+	work.AddWork(&MockWorkItem{sleep: 0})
+	
+	assert.Eventually(t, func() bool {
+		return work.GetQueueSize() == 1
+	}, 1*time.Second, 10*time.Millisecond, "Queue size should eventually be 1")
 }
 
 func TestNoneThreadCapacity(t *testing.T) {
@@ -82,13 +85,17 @@ func TestNoneThreadCapacity(t *testing.T) {
 	assert.Equal(t, work.HasThreadsCapacity(), false, "This must be false")
 	assert.Equal(t, work.GetProcessingCount(), 0, "This should be 0")
 	assert.Equal(t, work.GetThreadsOccupation(), 1.0, "This should be 1.0")
+	
 	for i := 0; i < 5; i++ {
-		work.AddWork(&MockWorkItem{sleep: 2 * time.Second})
+		work.AddWork(&MockWorkItem{sleep: 0})
 	}
-	time.Sleep(1 * time.Second)
+	
+	assert.Eventually(t, func() bool {
+		return work.GetQueueSize() == 5
+	}, 1*time.Second, 10*time.Millisecond, "Queue size should eventually be 5")
+	
 	assert.Equal(t, work.GetProcessingCount(), 0, "This should be 0")
 	assert.Equal(t, work.GetThreadsOccupation(), 1.0, "This should be 1.0")
-	assert.Equal(t, work.GetQueueSize(), 5, "This should be 5")
 }
 
 func TestProcessingWithSingleThread(t *testing.T) {
@@ -99,21 +106,28 @@ func TestProcessingWithSingleThread(t *testing.T) {
 	assert.Equal(t, work.HasThreadsCapacity(), true, "This must be true")
 	assert.Equal(t, work.GetProcessingCount(), 0, "This should be 0")
 	assert.Equal(t, work.GetThreadsOccupation(), 0.0, "This should be 0")
+	
 	jobs := []*MockWorkItem{
-		{sleep: 2 * time.Nanosecond},
-		{sleep: 3 * time.Nanosecond},
-		{sleep: 4 * time.Nanosecond},
-		{sleep: 5 * time.Nanosecond},
-		{sleep: 6 * time.Nanosecond},
-		{sleep: 7 * time.Nanosecond},
+		{sleep: 1 * time.Microsecond},
+		{sleep: 1 * time.Microsecond},
+		{sleep: 1 * time.Microsecond},
+		{sleep: 1 * time.Microsecond},
+		{sleep: 1 * time.Microsecond},
+		{sleep: 1 * time.Microsecond},
 	}
 	for _, job := range jobs {
 		work.AddWork(job)
 	}
-	time.Sleep(1 * time.Second)
+	
+	assert.Eventually(t, func() bool {
+		for _, job := range jobs {
+			if !job.executed.Load() {
+				return false
+			}
+		}
+		return true
+	}, 2*time.Second, 10*time.Millisecond, "All jobs should eventually execute")
+
 	assert.Equal(t, work.GetProcessingCount(), 0, "This should be 0")
 	assert.Equal(t, work.GetThreadsOccupation(), 0.0, "This should be 0")
-	for _, job := range jobs {
-		assert.Equal(t, job.excecuted, true, "This should be true")
-	}
 }
